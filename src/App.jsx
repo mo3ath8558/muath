@@ -1,5 +1,19 @@
-import React from 'react';
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
+import { initializeApp } from "firebase/app";
+import { getFirestore, doc, getDoc, setDoc } from "firebase/firestore";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyDXx_NmEFWP537_RSdz1OwqsaGhGpoVHLg",
+  authDomain: "planning-c9b2d.firebaseapp.com",
+  projectId: "planning-c9b2d",
+  storageBucket: "planning-c9b2d.firebasestorage.app",
+  messagingSenderId: "1077902449302",
+  appId: "1:1077902449302:web:c5626da29f3ee3c43000b7",
+  measurementId: "G-44QF2K6B8Z"
+};
+
+const firebaseApp = initializeApp(firebaseConfig);
+const db = getFirestore(firebaseApp);
 
 const DAYS = ["الأحد", "الاثنين", "الثلاثاء", "الأربعاء", "الخميس"];
 const WEEK_LABELS = ["الأول", "الثاني", "الثالث", "الرابع"];
@@ -20,11 +34,49 @@ const COLORS = {
   yearly:    { bg: "#1a0f0a", accent: "#fb923c", card: "#2a1a0f", border: "#4a2a1a", sub: "#351f0f" },
 };
 
+// معرف ثابت لجهازك — كل البيانات تحفظ تحت هذا المعرف في Firestore
+function getDeviceId() {
+  let id = localStorage.getItem("planner_device_id");
+  if (!id) {
+    id = "user_" + Math.random().toString(36).slice(2) + Date.now().toString(36);
+    localStorage.setItem("planner_device_id", id);
+  }
+  return id;
+}
+const DEVICE_ID = getDeviceId();
+
+// Hook يحفظ في localStorage فوراً + يزامن مع Firestore في الخلفية
 function useStorage(key, initial) {
   const [val, setVal] = useState(() => {
     try { const s = localStorage.getItem(key); return s ? JSON.parse(s) : initial; } catch { return initial; }
   });
-  const set = (v) => { setVal(v); try { localStorage.setItem(key, JSON.stringify(v)); } catch {} };
+  const loaded = useRef(false);
+
+  // تحميل البيانات من Firestore عند أول مرة
+  useEffect(() => {
+    (async () => {
+      try {
+        const ref = doc(db, "planners", DEVICE_ID, "data", key);
+        const snap = await getDoc(ref);
+        if (snap.exists()) {
+          const remote = snap.data().value;
+          setVal(JSON.parse(remote));
+          localStorage.setItem(key, remote);
+        }
+      } catch (e) { /* تجاهل الخطأ — يبقى يعمل من localStorage */ }
+      loaded.current = true;
+    })();
+  }, []);
+
+  const set = (v) => {
+    setVal(v);
+    try { localStorage.setItem(key, JSON.stringify(v)); } catch {}
+    try {
+      const ref = doc(db, "planners", DEVICE_ID, "data", key);
+      setDoc(ref, { value: JSON.stringify(v), updatedAt: Date.now() });
+    } catch (e) { /* تجاهل خطأ الشبكة */ }
+  };
+
   return [val, set];
 }
 
@@ -612,6 +664,38 @@ export default function App() {
   const [quarterlyTasks, setQuarterlyTasks] = useStorage("p3_quarterly", { slots: [null,null,null] });
   const [yearlyTasks,    setYearlyTasks]    = useStorage("p3_yearly",    { quarters: { Q1:null, Q2:null, Q3:null, Q4:null } });
 
+  const exportData = () => {
+    const data = {
+      weekly: weeklyTasks, monthly: monthlyTasks,
+      quarterly: quarterlyTasks, yearly: yearlyTasks,
+      exportDate: new Date().toLocaleDateString("ar-SA")
+    };
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "planner-backup-" + new Date().toISOString().split("T")[0] + ".json";
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const importData = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const data = JSON.parse(ev.target.result);
+        if (data.weekly)    setWeeklyTasks(data.weekly);
+        if (data.monthly)   setMonthlyTasks(data.monthly);
+        if (data.quarterly) setQuarterlyTasks(data.quarterly);
+        if (data.yearly)    setYearlyTasks(data.yearly);
+        alert("تم استيراد البيانات بنجاح ✅");
+      } catch { alert("خطأ في الملف — تأكد إنه ملف النسخة الاحتياطية الصحيح"); }
+    };
+    reader.readAsText(file);
+  };
+
   return (
     <div style={{
       minHeight: "100vh", background: colors.bg, direction: "rtl", padding: "18px 16px",
@@ -640,6 +724,23 @@ export default function App() {
                 <span style={{ marginLeft: "5px" }}>{n.icon}</span>{n.label}
               </button>
             ))}
+          </div>
+
+          {/* Export / Import */}
+          <div style={{ display: "flex", justifyContent: "center", gap: "8px", marginTop: "12px" }}>
+            <button onClick={exportData} style={{
+              padding: "7px 16px", borderRadius: "9px", fontFamily: "inherit", fontSize: "12px",
+              background: "rgba(255,255,255,0.08)", border: "1px solid rgba(255,255,255,0.15)",
+              color: "rgba(255,255,255,0.7)", cursor: "pointer"
+            }}>💾 تصدير نسخة احتياطية</button>
+            <label style={{
+              padding: "7px 16px", borderRadius: "9px", fontFamily: "inherit", fontSize: "12px",
+              background: "rgba(255,255,255,0.08)", border: "1px solid rgba(255,255,255,0.15)",
+              color: "rgba(255,255,255,0.7)", cursor: "pointer"
+            }}>
+              📂 استيراد نسخة احتياطية
+              <input type="file" accept=".json" onChange={importData} style={{ display: "none" }} />
+            </label>
           </div>
         </div>
 
