@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { initializeApp } from "firebase/app";
 import { getFirestore, doc, getDoc, setDoc } from "firebase/firestore";
 
+
 const firebaseConfig = {
   apiKey: "AIzaSyDXx_NmEFWP537_RSdz1OwqsaGhGpoVHLg",
   authDomain: "planning-c9b2d.firebaseapp.com",
