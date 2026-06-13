@@ -1,7 +1,10 @@
 import { useState, useEffect, useRef } from "react";
 import { initializeApp } from "firebase/app";
 import { getFirestore, doc, getDoc, setDoc } from "firebase/firestore";
-
+import {
+  getAuth, onAuthStateChanged, signInWithEmailAndPassword,
+  createUserWithEmailAndPassword, signOut
+} from "firebase/auth";
 
 const firebaseConfig = {
   apiKey: "AIzaSyDXx_NmEFWP537_RSdz1OwqsaGhGpoVHLg",
@@ -15,6 +18,7 @@ const firebaseConfig = {
 
 const firebaseApp = initializeApp(firebaseConfig);
 const db = getFirestore(firebaseApp);
+const auth = getAuth(firebaseApp);
 
 const DAYS = ["الأحد", "الاثنين", "الثلاثاء", "الأربعاء", "الخميس"];
 const WEEK_LABELS = ["الأول", "الثاني", "الثالث", "الرابع"];
@@ -35,50 +39,74 @@ const COLORS = {
   yearly:    { bg: "#1a0f0a", accent: "#fb923c", card: "#2a1a0f", border: "#4a2a1a", sub: "#351f0f" },
 };
 
-// معرف ثابت لجهازك — كل البيانات تحفظ تحت هذا المعرف في Firestore
-function getDeviceId() {
-  let id = localStorage.getItem("planner_device_id");
-  if (!id) {
-    id = "user_" + Math.random().toString(36).slice(2) + Date.now().toString(36);
-    localStorage.setItem("planner_device_id", id);
-  }
-  return id;
-}
-const DEVICE_ID = getDeviceId();
+// القيم الافتراضية لكل بيانات المخطط — مستند واحد فقط في Firestore لكل مستخدم
+const DEFAULT_DATA = {
+  p3_weekly: {},
+  p3_monthly: { slots: [null, null, null] },
+  p3_quarterly: { slots: [null, null, null] },
+  p3_yearly: { quarters: { Q1: null, Q2: null, Q3: null, Q4: null } },
+  weekly_transfer_summary: "",
+  weekly_transferred: false,
+  monthly_transfer_summary: "",
+  monthly_transferred: false,
+  quarterly_transfer_summary: "",
+  quarterly_transfer_label: "Q1",
+  quarterly_transferred: false,
+  annual_summary: "",
+};
 
-// Hook يحفظ في localStorage فوراً + يزامن مع Firestore في الخلفية
-function useStorage(key, initial) {
-  const [val, setVal] = useState(() => {
-    try { const s = localStorage.getItem(key); return s ? JSON.parse(s) : initial; } catch { return initial; }
+// Hook مركزي: كل البيانات في مستند واحد تحت uid المستخدم — يحفظ في localStorage فوراً ويزامن مع Firestore
+function useCloudStore(uid) {
+  const [data, setData] = useState(() => {
+    try {
+      const s = localStorage.getItem("planner_data_" + (uid || "guest"));
+      return s ? { ...DEFAULT_DATA, ...JSON.parse(s) } : { ...DEFAULT_DATA };
+    } catch { return { ...DEFAULT_DATA }; }
   });
-  const loaded = useRef(false);
+  const saveTimer = useRef(null);
 
-  // تحميل البيانات من Firestore عند أول مرة
+  // تحميل من Firestore عند تسجيل الدخول
   useEffect(() => {
+    if (!uid) return;
     (async () => {
       try {
-        const ref = doc(db, "planners", DEVICE_ID, "data", key);
+        const ref = doc(db, "users", uid);
         const snap = await getDoc(ref);
         if (snap.exists()) {
-          const remote = snap.data().value;
-          setVal(JSON.parse(remote));
-          localStorage.setItem(key, remote);
+          const remote = snap.data();
+          setData(prev => ({ ...DEFAULT_DATA, ...remote }));
+          localStorage.setItem("planner_data_" + uid, JSON.stringify(remote));
         }
-      } catch (e) { /* تجاهل الخطأ — يبقى يعمل من localStorage */ }
-      loaded.current = true;
+      } catch (e) { /* fallback to localStorage */ }
     })();
-  }, []);
+  }, [uid]);
 
-  const set = (v) => {
-    setVal(v);
-    try { localStorage.setItem(key, JSON.stringify(v)); } catch {}
-    try {
-      const ref = doc(db, "planners", DEVICE_ID, "data", key);
-      setDoc(ref, { value: JSON.stringify(v), updatedAt: Date.now() });
-    } catch (e) { /* تجاهل خطأ الشبكة */ }
+  // حفظ بعد كل تغيير — debounce بسيط لتجنب كتابات كثيرة
+  useEffect(() => {
+    try { localStorage.setItem("planner_data_" + (uid || "guest"), JSON.stringify(data)); } catch {}
+    if (!uid) return;
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(() => {
+      try {
+        const ref = doc(db, "users", uid);
+        setDoc(ref, data);
+      } catch (e) { /* تجاهل خطأ الشبكة */ }
+    }, 800);
+    return () => { if (saveTimer.current) clearTimeout(saveTimer.current); };
+  }, [data, uid]);
+
+  // واجهة شبيهة بـ useState لكل مفتاح
+  const useField = (key) => {
+    const value = data[key];
+    const setValue = (v) => {
+      setData(prev => ({ ...prev, [key]: typeof v === "function" ? v(prev[key]) : v }));
+    };
+    return [value, setValue];
   };
 
-  return [val, set];
+  const importAll = (newData) => setData(prev => ({ ...prev, ...newData }));
+
+  return { data, useField, importAll };
 }
 
 function ProgressBar({ tasks, accent }) {
@@ -265,13 +293,13 @@ function AIAnalyzeButton({ accent, prompt, onResult }) {
 }
 
 // ── Weekly View ────────────────────────────────────────────
-function WeeklyView({ colors, weeklyTasks, setWeeklyTasks, monthlyTasks, setMonthlyTasks, setActiveView }) {
+function WeeklyView({ colors, weeklyTasks, setWeeklyTasks, monthlyTasks, setMonthlyTasks, setActiveView, useField }) {
   const { accent, card, border, sub } = colors;
   const now = new Date();
   const currentWeekIdx = Math.min(Math.floor((now.getDate() - 1) / 7), 3);
 
-  const [transferSummary, setTransferSummary] = useStorage("weekly_transfer_summary", "");
-  const [transferred, setTransferred] = useStorage("weekly_transferred", false);
+  const [transferSummary, setTransferSummary] = useField("weekly_transfer_summary");
+  const [transferred, setTransferred] = useField("weekly_transferred");
 
   const toggle   = (wKey, day, id) => setWeeklyTasks(p => { const w = p[wKey] || { days: {} }; return { ...p, [wKey]: { ...w, days: { ...w.days, [day]: (w.days[day] || []).map(t => t.id === id ? { ...t, done: !t.done } : t) } } }; });
   const del      = (wKey, day, id) => setWeeklyTasks(p => { const w = p[wKey] || { days: {} }; return { ...p, [wKey]: { ...w, days: { ...w.days, [day]: (w.days[day] || []).filter(t => t.id !== id) } } }; });
@@ -389,11 +417,11 @@ function WeeklyView({ colors, weeklyTasks, setWeeklyTasks, monthlyTasks, setMont
 }
 
 // ── Monthly View ───────────────────────────────────────────
-function MonthlyView({ colors, monthlyTasks, setMonthlyTasks, quarterlyTasks, setQuarterlyTasks, setActiveView }) {
+function MonthlyView({ colors, monthlyTasks, setMonthlyTasks, quarterlyTasks, setQuarterlyTasks, setActiveView, useField }) {
   const { accent, card, border, sub } = colors;
   const slots = monthlyTasks.slots || [null, null, null];
-  const [transferSummary, setTransferSummary] = useStorage("monthly_transfer_summary", "");
-  const [transferred, setTransferred] = useStorage("monthly_transferred", false);
+  const [transferSummary, setTransferSummary] = useField("monthly_transfer_summary");
+  const [transferred, setTransferred] = useField("monthly_transferred");
 
   const doTransfer = () => {
     if (!transferSummary.trim()) return;
@@ -489,12 +517,12 @@ function MonthlyView({ colors, monthlyTasks, setMonthlyTasks, quarterlyTasks, se
 }
 
 // ── Quarterly View ─────────────────────────────────────────
-function QuarterlyView({ colors, quarterlyTasks, setQuarterlyTasks, yearlyTasks, setYearlyTasks, setActiveView }) {
+function QuarterlyView({ colors, quarterlyTasks, setQuarterlyTasks, yearlyTasks, setYearlyTasks, setActiveView, useField }) {
   const { accent, card, border, sub } = colors;
   const slots = quarterlyTasks.slots || [null, null, null];
-  const [transferSummary, setTransferSummary] = useStorage("quarterly_transfer_summary", "");
-  const [qLabel, setQLabel] = useStorage("quarterly_transfer_label", "Q1");
-  const [transferred, setTransferred] = useStorage("quarterly_transferred", false);
+  const [transferSummary, setTransferSummary] = useField("quarterly_transfer_summary");
+  const [qLabel, setQLabel] = useField("quarterly_transfer_label");
+  const [transferred, setTransferred] = useField("quarterly_transferred");
 
   const doTransfer = () => {
     if (!transferSummary.trim()) return;
@@ -581,10 +609,10 @@ function QuarterlyView({ colors, quarterlyTasks, setQuarterlyTasks, yearlyTasks,
 }
 
 // ── Yearly View ────────────────────────────────────────────
-function YearlyView({ colors, yearlyTasks, setYearlyTasks }) {
+function YearlyView({ colors, yearlyTasks, setYearlyTasks, useField }) {
   const { accent, card, border } = colors;
   const quarters = yearlyTasks.quarters || { Q1: null, Q2: null, Q3: null, Q4: null };
-  const [annualSummary, setAnnualSummary] = useStorage("annual_summary", "");
+  const [annualSummary, setAnnualSummary] = useField("annual_summary");
 
   const buildPrompt = () => {
     const parts = Q_LABELS.filter(q => quarters[q]).map(q => q + ": " + quarters[q].summary).join("\n");
@@ -655,22 +683,116 @@ function YearlyView({ colors, yearlyTasks, setYearlyTasks }) {
   );
 }
 
+// ── Login Screen ───────────────────────────────────────────
+function LoginScreen() {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [mode, setMode] = useState("login"); // login | signup
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  const submit = async () => {
+    setError("");
+    if (!email.trim() || !password.trim()) { setError("أدخل البريد وكلمة المرور"); return; }
+    setLoading(true);
+    try {
+      if (mode === "login") {
+        await signInWithEmailAndPassword(auth, email.trim(), password);
+      } else {
+        await createUserWithEmailAndPassword(auth, email.trim(), password);
+      }
+    } catch (e) {
+      const map = {
+        "auth/invalid-email": "البريد الإلكتروني غير صحيح",
+        "auth/user-not-found": "لا يوجد حساب بهذا البريد",
+        "auth/wrong-password": "كلمة المرور غير صحيحة",
+        "auth/invalid-credential": "البريد أو كلمة المرور غير صحيحة",
+        "auth/email-already-in-use": "هذا البريد مستخدم من قبل",
+        "auth/weak-password": "كلمة المرور ضعيفة — يجب 6 أحرف على الأقل",
+      };
+      setError(map[e.code] || "حدث خطأ، حاول مجدداً");
+    }
+    setLoading(false);
+  };
+
+  return (
+    <div style={{
+      minHeight: "100vh", background: "#0f172a", direction: "rtl",
+      display: "flex", alignItems: "center", justifyContent: "center", padding: "20px",
+      fontFamily: "'Noto Sans Arabic', sans-serif"
+    }}>
+      <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+Arabic:wght@300;400;600;700;900&display=swap" rel="stylesheet" />
+      <div style={{
+        width: "100%", maxWidth: "380px", background: "#1e293b", borderRadius: "18px",
+        padding: "32px 28px", border: "1px solid #334155"
+      }}>
+        <h1 style={{ color: "#fff", textAlign: "center", fontSize: "22px", fontWeight: "900", margin: "0 0 6px", fontFamily: "inherit" }}>
+          <span style={{ color: "#38bdf8" }}>✦</span> مخطط الإنجازات
+        </h1>
+        <p style={{ color: "rgba(255,255,255,0.4)", textAlign: "center", fontSize: "13px", margin: "0 0 24px", fontFamily: "inherit" }}>
+          {mode === "login" ? "سجّل دخولك للوصول لبياناتك" : "أنشئ حساباً جديداً"}
+        </p>
+
+        <input type="email" value={email} onChange={e => setEmail(e.target.value)}
+          placeholder="البريد الإلكتروني" style={{
+            width: "100%", padding: "12px 14px", borderRadius: "10px", marginBottom: "10px",
+            background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)",
+            color: "#fff", fontSize: "13px", fontFamily: "inherit", outline: "none", direction: "ltr",
+            textAlign: "right", boxSizing: "border-box"
+          }} />
+        <input type="password" value={password} onChange={e => setPassword(e.target.value)}
+          onKeyDown={e => e.key === "Enter" && submit()}
+          placeholder="كلمة المرور" style={{
+            width: "100%", padding: "12px 14px", borderRadius: "10px", marginBottom: "14px",
+            background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)",
+            color: "#fff", fontSize: "13px", fontFamily: "inherit", outline: "none", direction: "ltr",
+            textAlign: "right", boxSizing: "border-box"
+          }} />
+
+        {error && <p style={{ color: "#ef4444", fontSize: "12px", marginBottom: "12px", fontFamily: "inherit" }}>{error}</p>}
+
+        <button onClick={submit} disabled={loading} style={{
+          width: "100%", padding: "12px", borderRadius: "10px", fontFamily: "inherit", fontSize: "14px", fontWeight: "bold",
+          background: loading ? "rgba(255,255,255,0.1)" : "#38bdf8", border: "none",
+          color: loading ? "rgba(255,255,255,0.4)" : "#fff", cursor: loading ? "not-allowed" : "pointer", marginBottom: "14px"
+        }}>
+          {loading ? "..." : mode === "login" ? "تسجيل الدخول" : "إنشاء حساب"}
+        </button>
+
+        <p style={{ textAlign: "center", fontSize: "12px", color: "rgba(255,255,255,0.4)", fontFamily: "inherit", margin: 0 }}>
+          {mode === "login" ? "ليس لديك حساب؟ " : "لديك حساب؟ "}
+          <button onClick={() => { setMode(mode === "login" ? "signup" : "login"); setError(""); }} style={{
+            background: "none", border: "none", color: "#38bdf8", cursor: "pointer", fontSize: "12px", fontFamily: "inherit", fontWeight: "bold"
+          }}>{mode === "login" ? "أنشئ حساب" : "سجّل دخولك"}</button>
+        </p>
+      </div>
+    </div>
+  );
+}
+
 // ── Main App ───────────────────────────────────────────────
 export default function App() {
   const [activeView, setActiveView] = useState("weekly");
   const colors = COLORS[activeView];
 
-  const [weeklyTasks,    setWeeklyTasks]    = useStorage("p3_weekly",    {});
-  const [monthlyTasks,   setMonthlyTasks]   = useStorage("p3_monthly",   { slots: [null,null,null] });
-  const [quarterlyTasks, setQuarterlyTasks] = useStorage("p3_quarterly", { slots: [null,null,null] });
-  const [yearlyTasks,    setYearlyTasks]    = useStorage("p3_yearly",    { quarters: { Q1:null, Q2:null, Q3:null, Q4:null } });
+  const [user, setUser] = useState(undefined); // undefined = loading, null = logged out, object = logged in
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, (u) => setUser(u || null));
+    return unsub;
+  }, []);
+
+  const { data, useField, importAll } = useCloudStore(user ? user.uid : null);
+
+  const weeklyTasks    = data.p3_weekly;
+  const monthlyTasks   = data.p3_monthly;
+  const quarterlyTasks = data.p3_quarterly;
+  const yearlyTasks    = data.p3_yearly;
+  const setWeeklyTasks    = (v) => useField("p3_weekly")[1](v);
+  const setMonthlyTasks   = (v) => useField("p3_monthly")[1](v);
+  const setQuarterlyTasks = (v) => useField("p3_quarterly")[1](v);
+  const setYearlyTasks    = (v) => useField("p3_yearly")[1](v);
 
   const exportData = () => {
-    const data = {
-      weekly: weeklyTasks, monthly: monthlyTasks,
-      quarterly: quarterlyTasks, yearly: yearlyTasks,
-      exportDate: new Date().toLocaleDateString("ar-SA")
-    };
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -686,16 +808,25 @@ export default function App() {
     const reader = new FileReader();
     reader.onload = (ev) => {
       try {
-        const data = JSON.parse(ev.target.result);
-        if (data.weekly)    setWeeklyTasks(data.weekly);
-        if (data.monthly)   setMonthlyTasks(data.monthly);
-        if (data.quarterly) setQuarterlyTasks(data.quarterly);
-        if (data.yearly)    setYearlyTasks(data.yearly);
+        const parsed = JSON.parse(ev.target.result);
+        importAll(parsed);
         alert("تم استيراد البيانات بنجاح ✅");
       } catch { alert("خطأ في الملف — تأكد إنه ملف النسخة الاحتياطية الصحيح"); }
     };
     reader.readAsText(file);
   };
+
+  if (user === undefined) {
+    return (
+      <div style={{ minHeight: "100vh", background: "#0f172a", display: "flex", alignItems: "center", justifyContent: "center" }}>
+        <span style={{ color: "rgba(255,255,255,0.4)", fontFamily: "'Noto Sans Arabic', sans-serif" }}>جاري التحميل...</span>
+      </div>
+    );
+  }
+
+  if (user === null) {
+    return <LoginScreen />;
+  }
 
   return (
     <div style={{
@@ -706,6 +837,13 @@ export default function App() {
       <div style={{ maxWidth: "1000px", margin: "0 auto" }}>
 
         <div style={{ textAlign: "center", marginBottom: "24px" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
+            <span style={{ color: "rgba(255,255,255,0.35)", fontSize: "12px", fontFamily: "inherit" }}>{user.email}</span>
+            <button onClick={() => signOut(auth)} style={{
+              background: "none", border: "1px solid rgba(255,255,255,0.15)", color: "rgba(255,255,255,0.5)",
+              borderRadius: "8px", padding: "5px 12px", fontSize: "11px", cursor: "pointer", fontFamily: "inherit"
+            }}>تسجيل الخروج</button>
+          </div>
           <h1 style={{ color: "#fff", fontSize: "clamp(18px,3vw,26px)", fontWeight: "900", margin: "0 0 20px", fontFamily: "inherit" }}>
             <span style={{ color: colors.accent }}>✦</span> مخطط الإنجازات
           </h1>
@@ -745,10 +883,10 @@ export default function App() {
           </div>
         </div>
 
-        {activeView === "weekly"    && <WeeklyView    colors={colors} weeklyTasks={weeklyTasks} setWeeklyTasks={setWeeklyTasks} monthlyTasks={monthlyTasks} setMonthlyTasks={setMonthlyTasks} setActiveView={setActiveView} />}
-        {activeView === "monthly"   && <MonthlyView   colors={colors} monthlyTasks={monthlyTasks} setMonthlyTasks={setMonthlyTasks} quarterlyTasks={quarterlyTasks} setQuarterlyTasks={setQuarterlyTasks} setActiveView={setActiveView} />}
-        {activeView === "quarterly" && <QuarterlyView colors={colors} quarterlyTasks={quarterlyTasks} setQuarterlyTasks={setQuarterlyTasks} yearlyTasks={yearlyTasks} setYearlyTasks={setYearlyTasks} setActiveView={setActiveView} />}
-        {activeView === "yearly"    && <YearlyView    colors={colors} yearlyTasks={yearlyTasks} setYearlyTasks={setYearlyTasks} />}
+        {activeView === "weekly"    && <WeeklyView    colors={colors} weeklyTasks={weeklyTasks} setWeeklyTasks={setWeeklyTasks} monthlyTasks={monthlyTasks} setMonthlyTasks={setMonthlyTasks} setActiveView={setActiveView} useField={useField} />}
+        {activeView === "monthly"   && <MonthlyView   colors={colors} monthlyTasks={monthlyTasks} setMonthlyTasks={setMonthlyTasks} quarterlyTasks={quarterlyTasks} setQuarterlyTasks={setQuarterlyTasks} setActiveView={setActiveView} useField={useField} />}
+        {activeView === "quarterly" && <QuarterlyView colors={colors} quarterlyTasks={quarterlyTasks} setQuarterlyTasks={setQuarterlyTasks} yearlyTasks={yearlyTasks} setYearlyTasks={setYearlyTasks} setActiveView={setActiveView} useField={useField} />}
+        {activeView === "yearly"    && <YearlyView    colors={colors} yearlyTasks={yearlyTasks} setYearlyTasks={setYearlyTasks} useField={useField} />}
 
       </div>
     </div>
